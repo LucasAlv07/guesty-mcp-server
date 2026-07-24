@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { z } from "zod";
 import { getTier, getTierInfo, gatedHandler, FREE_TOOLS } from './license.js';
 import { registerIoTTools } from './iot-tools.js';
@@ -1553,8 +1553,12 @@ if (process.env.MCP_TRANSPORT === "http") {
     process.exit(1);
   }
 
+  const port = process.env.PORT || 3000;
+  const BASE_URL = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`;
+
   const app = express();
   app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
 
   // CORS (Cowork's servers call this cross-origin)
   app.use((req, res, next) => {
@@ -1578,6 +1582,87 @@ if (process.env.MCP_TRANSPORT === "http") {
     return true;
   }
 
+  // --- Minimal OAuth 2.1 (PKCE) wrapper -------------------------------------
+  // Claude's remote-connector flow performs OAuth discovery + Dynamic Client
+  // Registration + Authorization Code (PKCE) before it will call /mcp, even
+  // for a "custom connector". This is a single-tenant, auto-approve stand-in:
+  // whoever holds MCP_ACCESS_TOKEN (embedded in the discovery URL below) is
+  // the owner; the token this issues is just that same static secret.
+  const authCodes = new Map(); // code -> { codeChallenge, redirectUri, expires }
+
+  app.get("/.well-known/oauth-authorization-server", (_req, res) => {
+    res.json({
+      issuer: BASE_URL,
+      authorization_endpoint: `${BASE_URL}/authorize?key=${ACCESS_TOKEN}`,
+      token_endpoint: `${BASE_URL}/token`,
+      registration_endpoint: `${BASE_URL}/register`,
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
+      code_challenge_methods_supported: ["S256"],
+      token_endpoint_auth_methods_supported: ["none"],
+    });
+  });
+
+  app.get("/.well-known/oauth-protected-resource", (_req, res) => {
+    res.json({
+      resource: `${BASE_URL}/mcp`,
+      authorization_servers: [BASE_URL],
+    });
+  });
+
+  app.post("/register", (req, res) => {
+    const { redirect_uris = [], client_name } = req.body || {};
+    res.status(201).json({
+      client_id: "guesty-mcp-owner",
+      client_name: client_name || "Guesty MCP",
+      redirect_uris,
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+    });
+  });
+
+  app.get("/authorize", (req, res) => {
+    const { key, redirect_uri, state, code_challenge } = req.query;
+    if (key !== ACCESS_TOKEN) return res.status(403).send("Forbidden: missing/invalid key");
+    if (!redirect_uri) return res.status(400).send("Missing redirect_uri");
+    const code = randomUUID();
+    authCodes.set(code, { codeChallenge: code_challenge, redirectUri: redirect_uri, expires: Date.now() + 5 * 60 * 1000 });
+    const url = new URL(redirect_uri);
+    url.searchParams.set("code", code);
+    if (state) url.searchParams.set("state", state);
+    res.redirect(302, url.toString());
+  });
+
+  app.post("/token", (req, res) => {
+    const { grant_type, code, code_verifier, redirect_uri } = req.body || {};
+
+    if (grant_type === "refresh_token") {
+      return res.json({ access_token: ACCESS_TOKEN, token_type: "Bearer", expires_in: 31536000 });
+    }
+    if (grant_type !== "authorization_code") {
+      return res.status(400).json({ error: "unsupported_grant_type" });
+    }
+
+    const entry = authCodes.get(code);
+    if (!entry || entry.expires < Date.now()) {
+      return res.status(400).json({ error: "invalid_grant" });
+    }
+    authCodes.delete(code);
+    if (entry.redirectUri !== redirect_uri) {
+      return res.status(400).json({ error: "invalid_grant", error_description: "redirect_uri mismatch" });
+    }
+    if (entry.codeChallenge) {
+      const hash = createHash("sha256").update(code_verifier || "").digest("base64url");
+      if (hash !== entry.codeChallenge) {
+        return res.status(400).json({ error: "invalid_grant", error_description: "PKCE verification failed" });
+      }
+    }
+
+    res.json({ access_token: ACCESS_TOKEN, token_type: "Bearer", expires_in: 31536000, refresh_token: ACCESS_TOKEN });
+  });
+  // --- end OAuth wrapper -----------------------------------------------------
+
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", server: "guesty-mcp-server", transport: "http" });
   });
@@ -1597,9 +1682,8 @@ if (process.env.MCP_TRANSPORT === "http") {
     }
   });
 
-  const port = process.env.PORT || 3000;
   app.listen(port, () => {
-    console.error(`[http] Guesty MCP server listening on port ${port} (POST /mcp, token-protected)`);
+    console.error(`[http] Guesty MCP server listening on port ${port} (POST /mcp, OAuth-wrapped)`);
   });
 } else {
   const transport = new StdioServerTransport();
