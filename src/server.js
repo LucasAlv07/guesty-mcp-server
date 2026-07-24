@@ -1667,17 +1667,22 @@ if (process.env.MCP_TRANSPORT === "http") {
     res.json({ status: "ok", server: "guesty-mcp-server", transport: "http" });
   });
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
-  await server.connect(transport);
-
+  // Stateless per-request transport (SDK-recommended pattern for simple
+  // remote tool servers): each HTTP request gets its own short-lived MCP
+  // session, so retried/duplicate "initialize" calls from the client never
+  // collide with a previously-connected session.
   app.all("/mcp", async (req, res) => {
     if (!checkAuth(req, res)) return;
+    console.error(`[http] ${req.method} /mcp body.method=${req.body?.method || "-"}`);
     try {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+      res.on("close", () => transport.close());
+      await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (err) {
-      console.error("[http] request error:", err);
+      console.error("[http] request error:", err.stack || err.message);
       if (!res.headersSent) res.status(500).json({ error: err.message });
     }
   });
