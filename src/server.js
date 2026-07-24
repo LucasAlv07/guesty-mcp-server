@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express from "express";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { getTier, getTierInfo, gatedHandler, FREE_TOOLS } from './license.js';
 import { registerIoTTools } from './iot-tools.js';
@@ -1540,6 +1543,65 @@ registerIoTTools(server);
 registerEnterpriseTools(server);
 registerResources(server, { guestyGet });
 
-// Start server
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// Start server — stdio for local/npx use, HTTP for remote deployments.
+// Set MCP_TRANSPORT=http (and PORT, MCP_ACCESS_TOKEN) when deploying this
+// as a remote MCP connector (e.g. for Claude Cowork's "Custom connector" URL field).
+if (process.env.MCP_TRANSPORT === "http") {
+  const ACCESS_TOKEN = process.env.MCP_ACCESS_TOKEN;
+  if (!ACCESS_TOKEN) {
+    console.error("Error: MCP_ACCESS_TOKEN is required when MCP_TRANSPORT=http (prevents anyone with the URL from controlling your Guesty account).");
+    process.exit(1);
+  }
+
+  const app = express();
+  app.use(express.json());
+
+  // CORS (Cowork's servers call this cross-origin)
+  app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+  });
+
+  // Shared-secret auth: require ?token=... or Authorization: Bearer ...
+  function checkAuth(req, res) {
+    const header = req.headers["authorization"] || "";
+    const bearer = header.startsWith("Bearer ") ? header.slice(7) : null;
+    const provided = bearer || req.query.token;
+    if (provided !== ACCESS_TOKEN) {
+      res.status(401).json({ error: "Unauthorized" });
+      return false;
+    }
+    return true;
+  }
+
+  app.get("/health", (_req, res) => {
+    res.json({ status: "ok", server: "guesty-mcp-server", transport: "http" });
+  });
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+  });
+  await server.connect(transport);
+
+  app.all("/mcp", async (req, res) => {
+    if (!checkAuth(req, res)) return;
+    try {
+      await transport.handleRequest(req, res, req.body);
+    } catch (err) {
+      console.error("[http] request error:", err);
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+    }
+  });
+
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => {
+    console.error(`[http] Guesty MCP server listening on port ${port} (POST /mcp, token-protected)`);
+  });
+} else {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
