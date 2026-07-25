@@ -73,6 +73,35 @@ export function buildReservationFilters({ listingId, checkInFrom, checkInTo, che
   return filters;
 }
 
+// RATE_LIMIT_FIX: Guesty's Open API caps requests at 15/s, 120/min, 5000/hr.
+// Spacing every call by THROTTLE_MS keeps us comfortably under the per-second
+// and per-minute caps proactively, instead of only reacting after a 429.
+// A shared promise chain serializes concurrent callers through the same pacer.
+const THROTTLE_MS = 550; // ~109 req/min ceiling, well under the 120/min cap
+let _lastCallAt = 0;
+let _throttleChain = Promise.resolve();
+function throttle() {
+  const runner = async () => {
+    const waitMs = _lastCallAt + THROTTLE_MS - Date.now();
+    if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+    _lastCallAt = Date.now();
+  };
+  _throttleChain = _throttleChain.then(runner, runner);
+  return _throttleChain;
+}
+
+// Retries on 429 (rate limited) and on transient gateway errors (502/503/504)
+// — the latter show up as Cloudflare/proxy hiccups unrelated to Guesty's rate
+// limit and were previously not retried at all.
+function isRetryableStatus(status) {
+  return status === 429 || status === 502 || status === 503 || status === 504;
+}
+function retryWaitMs(res, attemptsLeft) {
+  const retryAfter = res.headers.get("retry-after");
+  if (retryAfter) return Math.min(parseInt(retryAfter, 10), 30) * 1000;
+  return (3 - attemptsLeft) * 2000; // 2s, then 4s backoff when no Retry-After header
+}
+
 export async function guestyGet(path, params = {}, retries = 2) {
   const token = await getToken();
   const url = new URL(`${GUESTY_API_BASE}${path}`);
@@ -80,13 +109,13 @@ export async function guestyGet(path, params = {}, retries = 2) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   });
 
+  await throttle();
   const res = await fetch(url.toString(), {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
   });
 
-  if (res.status === 429 && retries > 0) {
-    const wait = Math.min(parseInt(res.headers.get("retry-after") || "5", 10), 30) * 1000;
-    await new Promise((r) => setTimeout(r, wait));
+  if (isRetryableStatus(res.status) && retries > 0) {
+    await new Promise((r) => setTimeout(r, retryWaitMs(res, retries)));
     return guestyGet(path, params, retries - 1);
   }
 
@@ -96,6 +125,7 @@ export async function guestyGet(path, params = {}, retries = 2) {
 
 async function guestyPost(path, body, retries = 2) {
   const token = await getToken();
+  await throttle();
   const res = await fetch(`${GUESTY_API_BASE}${path}`, {
     method: "POST",
     headers: {
@@ -106,9 +136,8 @@ async function guestyPost(path, body, retries = 2) {
     body: JSON.stringify(body),
   });
 
-  if (res.status === 429 && retries > 0) {
-    const wait = Math.min(parseInt(res.headers.get("retry-after") || "5", 10), 30) * 1000;
-    await new Promise((r) => setTimeout(r, wait));
+  if (isRetryableStatus(res.status) && retries > 0) {
+    await new Promise((r) => setTimeout(r, retryWaitMs(res, retries)));
     return guestyPost(path, body, retries - 1);
   }
 
@@ -118,6 +147,7 @@ async function guestyPost(path, body, retries = 2) {
 
 async function guestyPut(path, body, retries = 2) {
   const token = await getToken();
+  await throttle();
   const res = await fetch(`${GUESTY_API_BASE}${path}`, {
     method: "PUT",
     headers: {
@@ -128,9 +158,8 @@ async function guestyPut(path, body, retries = 2) {
     body: JSON.stringify(body),
   });
 
-  if (res.status === 429 && retries > 0) {
-    const wait = Math.min(parseInt(res.headers.get("retry-after") || "5", 10), 30) * 1000;
-    await new Promise((r) => setTimeout(r, wait));
+  if (isRetryableStatus(res.status) && retries > 0) {
+    await new Promise((r) => setTimeout(r, retryWaitMs(res, retries)));
     return guestyPut(path, body, retries - 1);
   }
 
@@ -140,14 +169,14 @@ async function guestyPut(path, body, retries = 2) {
 
 async function guestyDelete(path, retries = 2) {
   const token = await getToken();
+  await throttle();
   const res = await fetch(`${GUESTY_API_BASE}${path}`, {
     method: "DELETE",
     headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
   });
 
-  if (res.status === 429 && retries > 0) {
-    const wait = Math.min(parseInt(res.headers.get("retry-after") || "5", 10), 30) * 1000;
-    await new Promise((r) => setTimeout(r, wait));
+  if (isRetryableStatus(res.status) && retries > 0) {
+    await new Promise((r) => setTimeout(r, retryWaitMs(res, retries)));
     return guestyDelete(path, retries - 1);
   }
 
