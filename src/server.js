@@ -229,6 +229,7 @@ server.tool(
   {
     listingId: z.string().optional().describe("Specific listing ID. Omit to get all listings."),
     limit: z.number().optional().default(25).describe("Max results when fetching all"),
+    skip: z.number().optional().default(0).describe("Offset for pagination when fetching all"),
   },
   { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async (params) => {
@@ -247,10 +248,11 @@ server.tool(
         propertyType: l.propertyType,
         prices: l.prices,
         status: l.active ? "active" : "inactive",
+        isListed: l.isListed,
       };
       return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
     } else {
-      data = await guestyGet("/listings", { limit: params.limit });
+      data = await guestyGet("/listings", { limit: params.limit, skip: params.skip });
       const listings = (data.results || []).map((l) => ({
         id: l._id,
         title: l.title,
@@ -260,8 +262,9 @@ server.tool(
         bathrooms: l.bathrooms,
         maxGuests: l.accommodates,
         active: l.active,
+        isListed: l.isListed,
       }));
-      return { content: [{ type: "text", text: JSON.stringify({ total: data.count, listings }, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ total: data.count, skip: params.skip, listings }, null, 2) }] };
     }
   }
 );
@@ -663,6 +666,8 @@ server.tool(
   "List connected booking channels (Airbnb, VRBO, Booking.com, etc.) and their status.",
   {
     listingId: z.string().optional().describe("Filter by listing ID to see which channels a property is on"),
+    limit: z.number().optional().default(50).describe("Max results when fetching all"),
+    skip: z.number().optional().default(0).describe("Offset for pagination when fetching all"),
   },
   { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async (params) => {
@@ -675,20 +680,21 @@ server.tool(
         status: i.status,
       }));
       return {
-        content: [{ type: "text", text: JSON.stringify({ listing: listing.title, channels }, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify({ listing: listing.title, isListed: listing.isListed, channels }, null, 2) }],
       };
     }
     // Get all listings with their channel info
-    const data = await guestyGet("/listings", { limit: 50 });
+    const data = await guestyGet("/listings", { limit: params.limit, skip: params.skip });
     const listings = (data.results || []).map((l) => ({
       id: l._id,
       title: l.title,
       nickname: l.nickname,
       channels: (l.integrations || []).map((i) => i.platform).join(", ") || "none",
       active: l.active,
+      isListed: l.isListed,
     }));
     return {
-      content: [{ type: "text", text: JSON.stringify({ total: data.count, listings }, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify({ total: data.count, skip: params.skip, listings }, null, 2) }],
     };
   }
 );
